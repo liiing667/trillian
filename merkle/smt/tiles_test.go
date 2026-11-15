@@ -260,3 +260,122 @@ func TestTileSetMutationBuild(t *testing.T) {
 		})
 	}
 }
+
+func TestTileSetMutationBuildVerifiesRootHash(t *testing.T) {
+	l := NewLayout([]uint{8, 8, 8})
+	// The verified tile is the middle-tier tile rooted at 16 bits; updates at
+	// its 16-bit leaf level make Build load and re-check this persisted tile.
+	tileID := node.NewID("\x00\x00", 16)
+	id00 := node.NewID("\x00\x00\x00", 24)
+	id70 := node.NewID("\x00\x00\x70", 24)
+	id0000 := id00
+	id0070 := id70
+
+	newSet := func() *TileSet {
+		ts := NewTileSet(0, coniks.Default, l)
+		// Root tile stores the expected root hash of the 8-bit subtree as one
+		// of its leaves; the 8-bit tile below holds the hash of the 16-bit tile
+		// root that gets re-verified.
+		root8 := tileID.Prefix(8)
+		if err := ts.Add(Tile{Leaves: []Node{{ID: root8, Hash: []byte("root-of-00")}}}); err != nil {
+			t.Fatalf("Add(root tile): %v", err)
+		}
+		if err := ts.Add(Tile{
+			ID:     root8,
+			Leaves: []Node{{ID: tileID, Hash: []byte("root-of-0000")}},
+		}); err != nil {
+			t.Fatalf("Add(tile 0x00): %v", err)
+		}
+		if err := ts.Add(Tile{
+			ID: tileID,
+			Leaves: []Node{
+				{ID: id00, Hash: []byte("hash_0000")},
+				{ID: id70, Hash: []byte("hash_0070")},
+			},
+		}); err != nil {
+			t.Fatalf("Add(tile 0x00): %v", err)
+		}
+		return ts
+	}
+
+	t.Run("untampered-update-succeeds", func(t *testing.T) {
+		ts := newSet()
+		// Compute the genuine root hash and plant it as the parent-tile leaf.
+		genuine, err := Tile{
+			ID:     tileID,
+			Leaves: ts.tiles[tileID],
+		}.rootHash(l, ts.h)
+		if err != nil {
+			t.Fatalf("rootHash: %v", err)
+		}
+		ts.hashes[tileID] = genuine
+
+		m := NewTileSetMutation(ts)
+		m.Set(id0000, []byte("new_000000"))
+		if _, err := m.Build(); err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+	})
+
+	t.Run("tampered-persisted-leaf-rejected", func(t *testing.T) {
+		ts := newSet()
+		genuine, err := Tile{
+			ID:     tileID,
+			Leaves: ts.tiles[tileID],
+		}.rootHash(l, ts.h)
+		if err != nil {
+			t.Fatalf("rootHash: %v", err)
+		}
+		ts.hashes[tileID] = genuine
+
+		// Tamper with a persisted node hash; the recorded root stays genuine.
+		ts.tiles[tileID][0].Hash = []byte("tampered")
+
+		m := NewTileSetMutation(ts)
+		m.Set(id0070, []byte("new_000070"))
+		if _, err := m.Build(); err == nil ||
+			!strings.Contains(err.Error(), "persisted root hash") {
+			t.Fatalf("Build: got %v, want persisted root hash mismatch", err)
+		}
+	})
+
+	t.Run("misfiled-node-rejected", func(t *testing.T) {
+		ts := newSet()
+		genuine, err := Tile{
+			ID:     tileID,
+			Leaves: ts.tiles[tileID],
+		}.rootHash(l, ts.h)
+		if err != nil {
+			t.Fatalf("rootHash: %v", err)
+		}
+		ts.hashes[tileID] = genuine
+
+		// Replace a persisted node with one from another subtree. The first and
+		// last IDs alone would not catch this when it sits in the middle.
+		other := node.NewID("\x00\x01\x01", 24)
+		ts.tiles[tileID] = []Node{
+			{ID: id00, Hash: []byte("hash_0000")},
+			{ID: other, Hash: []byte("hash_0101")},
+			{ID: id70, Hash: []byte("hash_0070")},
+		}
+
+		m := NewTileSetMutation(ts)
+		m.Set(id0000, []byte("new_000000"))
+		if _, err := m.Build(); err == nil ||
+			!strings.Contains(err.Error(), "tile leaves") {
+			t.Fatalf("Build: got %v, want structural tile validation error", err)
+		}
+	})
+
+	t.Run("missing-recorded-root-rejected", func(t *testing.T) {
+		ts := newSet()
+		delete(ts.hashes, tileID)
+
+		m := NewTileSetMutation(ts)
+		m.Set(id0000, []byte("new_000000"))
+		if _, err := m.Build(); err == nil ||
+			!strings.Contains(err.Error(), "no persisted root hash") {
+			t.Fatalf("Build: got %v, want missing root hash error", err)
+		}
+	})
+}

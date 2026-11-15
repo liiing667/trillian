@@ -15,7 +15,6 @@
 package smt
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/google/trillian/merkle/smt/node"
@@ -43,19 +42,34 @@ type Tile struct {
 // Merge returns a new tile which is a combination of this tile with the given
 // updates. The resulting tile contains all the nodes from the updates, and all
 // the nodes from the original tile not present in the updates.
+//
+// Both the current tile and the updates must satisfy all the Tile invariants
+// documented on the Tile type: node IDs must be strictly below the tile root,
+// all at the same depth, ordered from left to right, and unique. Merge
+// verifies these invariants on both inputs regardless of whether the current
+// tile is empty, and returns an error if any of them is violated. The returned
+// tile owns its Leaves slice, i.e. it does not share the backing storage with
+// either of the inputs, so subsequent mutations of the inputs do not affect
+// the result.
 func (t Tile) Merge(updates NodesRow) (Tile, error) {
+	if err := t.Leaves.validate(t.ID); err != nil {
+		return Tile{}, fmt.Errorf("tile leaves: %v", err)
+	}
 	if len(updates) == 0 {
-		return t, nil
-	} else if len(t.Leaves) == 0 {
-		return Tile{ID: t.ID, Leaves: updates}, nil
+		return Tile{ID: t.ID, Leaves: t.Leaves.clone()}, nil
 	}
-	if at, want := updates[0].ID.BitLen(), t.Leaves[0].ID.BitLen(); at != want {
-		return Tile{}, fmt.Errorf("updates are at depth %d, want %d", at, want)
+	if err := updates.validate(t.ID); err != nil {
+		return Tile{}, fmt.Errorf("updates: %v", err)
 	}
-	if !updates.inSubtree(t.ID) {
-		return Tile{}, errors.New("updates are not entirely in this tile")
+	if len(t.Leaves) > 0 {
+		if at, want := updates[0].ID.BitLen(), t.Leaves[0].ID.BitLen(); at != want {
+			return Tile{}, fmt.Errorf("updates are at depth %d, want %d", at, want)
+		}
 	}
-	return Tile{ID: t.ID, Leaves: merge(t.Leaves, updates)}, nil
+	if len(t.Leaves) == 0 {
+		return Tile{ID: t.ID, Leaves: updates.clone()}, nil
+	}
+	return Tile{ID: t.ID, Leaves: merge(t.Leaves.clone(), updates.clone())}, nil
 }
 
 // merge merges two sorted slices of nodes into one sorted slice. If a node ID
@@ -75,6 +89,34 @@ func merge(nodes, updates NodesRow) NodesRow {
 		res = append(res, u)
 	}
 	return append(res, nodes[i:]...)
+}
+
+// rootHash recomputes the hash of the tile root from the tile leaves. All the
+// sibling subtrees missing from Leaves are assumed to be empty. The tile must
+// satisfy the invariants documented on the Tile type.
+//
+// It can be used to verify that persisted tile nodes were not tampered with by
+// comparing the recomputed hash against the tile root hash recorded in the
+// parent tile.
+func (t Tile) rootHash(l Layout, h mapHasher) ([]byte, error) {
+	if len(t.Leaves) == 0 {
+		return h.hashEmpty(t.ID), nil
+	}
+	top := t.ID.BitLen()
+	_, height := l.Locate(top + 1)
+	leaves := make([]Node, len(t.Leaves))
+	copy(leaves, t.Leaves)
+	hs, err := NewHStar3(leaves, h.mh.HashChildren, top+height, top)
+	if err != nil {
+		return nil, err
+	}
+	upd, err := hs.Update(emptyHashes{h: h})
+	if err != nil {
+		return nil, err
+	} else if len(upd) != 1 {
+		return nil, fmt.Errorf("expected a single root update, got %d", len(upd))
+	}
+	return upd[0].Hash, nil
 }
 
 // scan visits all non-empty nodes of the tile except the root. The order of
@@ -107,5 +149,8 @@ func (e emptyHashes) Get(id node.ID) ([]byte, error) {
 
 // Set calls the visitor callback for the given node and hash.
 func (e emptyHashes) Set(id node.ID, hash []byte) {
+	if e.visit == nil {
+		return
+	}
 	e.visit(Node{ID: id, Hash: hash})
 }

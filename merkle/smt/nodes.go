@@ -46,19 +46,46 @@ func NewNodesRow(nodes []Node) (NodesRow, error) {
 	return nodes, nil
 }
 
-// inSubtree returns whether all the nodes in this row are strictly under the
-// node with the given ID. Panics if the row is empty.
-func (n NodesRow) inSubtree(root node.ID) bool {
+// validate verifies all the Tile invariants for this row against the given
+// tile root: every node is strictly below the root and shares its prefix, all
+// the nodes are at the same depth, the row is ordered by ID from left to
+// right, and node IDs are unique. An empty row is always valid.
+func (n NodesRow) validate(root node.ID) error {
+	if len(n) == 0 {
+		return nil
+	}
 	rootLen := root.BitLen()
-	if n[0].ID.BitLen() <= rootLen {
-		return false
+	depth := n[0].ID.BitLen()
+	if depth <= rootLen {
+		return fmt.Errorf("node depth %d is not below the tile root at depth %d", depth, rootLen)
 	}
-	if n[0].ID.Prefix(rootLen) != root {
-		return false
+	for i, nd := range n {
+		if d := nd.ID.BitLen(); d != depth {
+			return fmt.Errorf("node #%d: invalid depth %d, want %d", i, d, depth)
+		}
+		if nd.ID.Prefix(rootLen) != root {
+			return fmt.Errorf("node #%d: %v is not in the tile subtree %v", i, nd.ID, root)
+		}
+		if i > 0 {
+			if c := compareHorizontal(n[i-1].ID, nd.ID); c > 0 {
+				return fmt.Errorf("node #%d: row is not sorted by ID", i)
+			} else if c == 0 {
+				return fmt.Errorf("duplicate ID: %v", nd.ID)
+			}
+		}
 	}
-	// Note: It is enough to check only the first and the last node ID because
-	// the list is sorted.
-	return len(n) == 1 || n[len(n)-1].ID.Prefix(rootLen) == root
+	return nil
+}
+
+// clone returns a copy of this row which does not share the backing slice
+// with the original. An empty row remains empty.
+func (n NodesRow) clone() NodesRow {
+	if len(n) == 0 {
+		return nil
+	}
+	res := make(NodesRow, len(n))
+	copy(res, n)
+	return res
 }
 
 // Prepare sorts the nodes slice for it to be usable by HStar3 algorithm and

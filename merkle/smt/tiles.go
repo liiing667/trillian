@@ -98,14 +98,36 @@ func (t *TileSetMutation) Build() ([]Tile, error) {
 		sort.Slice(upd, func(i, j int) bool {
 			return compareHorizontal(upd[i].ID, upd[j].ID) < 0
 		})
-		had, ok := t.read.tiles[id]
-		if !ok {
-			res = append(res, Tile{ID: id, Leaves: upd})
-			continue
+		tile := Tile{ID: id}
+		if had, ok := t.read.tiles[id]; ok {
+			tile.Leaves = had
 		}
-		tile, err := Tile{ID: id, Leaves: had}.Merge(upd)
+		var err error
+		// First enforce the structural Tile invariants on both the persisted
+		// nodes and the updates, rejecting cross-subtree, wrong-depth, unsorted,
+		// and duplicate nodes before any hash is recomputed.
+		tile, err = tile.Merge(upd)
 		if err != nil {
 			return nil, err
+		}
+		rootDepth, _ := t.read.layout.Locate(id.BitLen())
+		if had, ok := t.read.tiles[id]; ok && len(had) > 0 && rootDepth != 0 {
+			// Then re-verify the persisted tile against the root hash recorded in
+			// the parent tile, so that tampered persisted nodes can never
+			// participate in root hash computation. Tiles of the topmost tier
+			// (rootDepth == 0) have no parent tile with a recorded root hash, so
+			// they are the trust boundary.
+			want, ok := t.read.hashes[id]
+			if !ok {
+				return nil, fmt.Errorf("tile %v: no persisted root hash found for verification", id)
+			}
+			got, err := Tile{ID: id, Leaves: had}.rootHash(t.read.layout, t.read.h)
+			if err != nil {
+				return nil, fmt.Errorf("recomputing root hash of tile %v: %v", id, err)
+			}
+			if !bytes.Equal(got, want) {
+				return nil, fmt.Errorf("tile %v: persisted root hash %x does not match the recomputed one %x", id, want, got)
+			}
 		}
 		res = append(res, tile)
 	}

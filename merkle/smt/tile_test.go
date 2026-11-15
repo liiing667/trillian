@@ -76,13 +76,61 @@ func TestTileMerge(t *testing.T) {
 			desc:    "wrong-depth",
 			was:     []Node{n(0, "old")},
 			upd:     []Node{{ID: id}},
-			wantErr: "updates are at depth",
+			wantErr: "updates: node depth 8 is not below the tile root",
 		},
 		{
 			desc:    "wrong-tile",
 			was:     []Node{n(0, "old")},
 			upd:     []Node{n(5, "new")},
-			wantErr: "updates are not entirely in this tile",
+			wantErr: "updates: node #0:",
+		},
+		{
+			desc:    "empty-wrong-depth",
+			upd:     []Node{{ID: id}},
+			wantErr: "updates: node depth 8 is not below the tile root",
+		},
+		{
+			desc:    "empty-wrong-tile",
+			upd:     []Node{n(5, "h")},
+			wantErr: "updates: node #0:",
+		},
+		{
+			desc:    "empty-unsorted",
+			upd:     []Node{n(2, "h2"), n(1, "h1")},
+			wantErr: "updates: node #1: row is not sorted",
+		},
+		{
+			desc:    "empty-duplicate",
+			upd:     []Node{n(1, "h1"), n(1, "h2")},
+			wantErr: "updates: duplicate ID",
+		},
+		{
+			desc:    "unsorted",
+			was:     []Node{n(0, "old")},
+			upd:     []Node{n(2, "h2"), n(1, "h1")},
+			wantErr: "updates: node #1: row is not sorted",
+		},
+		{
+			desc:    "duplicate",
+			was:     []Node{n(0, "old")},
+			upd:     []Node{n(1, "h1"), n(1, "h2")},
+			wantErr: "updates: duplicate ID",
+		},
+		{
+			desc:    "mixed-depth",
+			was:     []Node{n(0, "old")},
+			upd:     []Node{n(1, "h1"), {ID: node.NewID("\xAB\x01", 12)}},
+			wantErr: "updates: node #1: invalid depth",
+		},
+		{
+			desc: "cross-subtree-in-the-middle",
+			was: []Node{
+				n(0, "old0"),
+				{ID: node.NewID("\xAC\x00", 15), Hash: []byte("other")},
+				n(1, "old1"),
+			},
+			upd:     []Node{n(2, "new2")},
+			wantErr: "tile leaves: node #1:",
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -105,6 +153,111 @@ func TestTileMerge(t *testing.T) {
 				t.Errorf("Merge result mismatch:\n%s", d)
 			}
 		})
+	}
+}
+
+func TestTileMergeCopiesInputs(t *testing.T) {
+	id := node.NewID("\xAB", 8)
+	leaf := func(suffix byte, hash string) Node {
+		return Node{ID: node.NewID("\xAB"+string(suffix), 15), Hash: []byte(hash)}
+	}
+	sharesBacking := func(a, b NodesRow) bool {
+		return len(a) > 0 && len(b) > 0 && &a[:1][0] == &b[:1][0]
+	}
+
+	t.Run("empty-updates-returns-copy", func(t *testing.T) {
+		was := NodesRow{leaf(0x00, "h")}
+		tile := Tile{ID: id, Leaves: was}
+		got, err := tile.Merge(nil)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if sharesBacking(got.Leaves, was) {
+			t.Fatal("result Leaves share backing storage with the original tile")
+		}
+	})
+
+	t.Run("empty-tile-copies-updates", func(t *testing.T) {
+		upd := NodesRow{leaf(0x00, "h"), leaf(0x10, "h2")}
+		got, err := Tile{ID: id}.Merge(upd)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if sharesBacking(got.Leaves, upd) {
+			t.Fatal("result Leaves share backing storage with updates")
+		}
+	})
+
+	t.Run("merge-result-is-independent", func(t *testing.T) {
+		was := NodesRow{leaf(0x00, "old"), leaf(0x20, "old2")}
+		upd := NodesRow{leaf(0x10, "new")}
+		got, err := Tile{ID: id, Leaves: was}.Merge(upd)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if sharesBacking(got.Leaves, was) || sharesBacking(got.Leaves, upd) {
+			t.Fatal("result Leaves share backing storage with an input")
+		}
+		// Mutating the inputs must not affect the returned tile.
+		was[0].Hash = []byte("tampered")
+		upd[0].Hash = []byte("tampered")
+		if got.Leaves[0].Hash[0] != 'o' || got.Leaves[1].Hash[0] != 'n' {
+			t.Fatal("mutating an input changed the merged tile")
+		}
+	})
+}
+
+func TestTileRootHash(t *testing.T) {
+	l := NewLayout([]uint{8, 8})
+	h := bindHasher(coniks.Default, 1)
+	tileID := node.NewID("\x00", 8)
+	leaves := []Node{
+		{ID: node.NewID("\x00\x01", 16), Hash: []byte("hash_0001")},
+		{ID: node.NewID("\x00\x70", 16), Hash: []byte("hash_0070")},
+	}
+
+	got, err := Tile{ID: tileID, Leaves: leaves}.rootHash(l, h)
+	if err != nil {
+		t.Fatalf("rootHash: %v", err)
+	}
+
+	// Compute the expected root independently with a bare HStar3 instance.
+	leavesCopy := make([]Node, len(leaves))
+	copy(leavesCopy, leaves)
+	hs, err := NewHStar3(leavesCopy, h.mh.HashChildren, 16, 8)
+	if err != nil {
+		t.Fatalf("NewHStar3: %v", err)
+	}
+	upd, err := hs.Update(emptyHashes{h: h})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(upd) != 1 || upd[0].ID != tileID {
+		t.Fatalf("expected a single root update at %v, got %v", tileID, upd)
+	}
+	if !reflect.DeepEqual(got, upd[0].Hash) {
+		t.Fatalf("rootHash = %x, want %x", got, upd[0].Hash)
+	}
+
+	// An empty tile hashes as an empty subtree at its root.
+	emptyRoot, err := Tile{ID: tileID}.rootHash(l, h)
+	if err != nil {
+		t.Fatalf("rootHash(empty): %v", err)
+	}
+	if !reflect.DeepEqual(emptyRoot, h.hashEmpty(tileID)) {
+		t.Fatalf("empty rootHash = %x, want hashEmpty %x", emptyRoot, h.hashEmpty(tileID))
+	}
+
+	// Tampering with a leaf hash must change the recomputed root hash.
+	tampered := make([]Node, len(leaves))
+	copy(tampered, leaves)
+	tampered[0].Hash = []byte("tampered")
+	bad, err := Tile{ID: tileID, Leaves: tampered}.rootHash(l, h)
+	if err != nil {
+		t.Fatalf("rootHash(tampered): %v", err)
+	}
+	if reflect.DeepEqual(bad, got) {
+		t.Fatal("tampered leaves produced the same root hash")
 	}
 }
 
