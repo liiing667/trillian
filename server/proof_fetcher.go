@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/trillian"
 	"github.com/google/trillian/storage/tree"
+	"github.com/transparency-dev/merkle"
 	"github.com/transparency-dev/merkle/compact"
 	"github.com/transparency-dev/merkle/proof"
 )
@@ -74,4 +75,31 @@ func fetchNodes(ctx context.Context, nr nodeReader, ids []compact.NodeID) ([]tre
 	}
 
 	return nodes, nil
+}
+
+// rootHashAtSize computes the root hash of the tree at the requested size,
+// using the same read-only snapshot as the proof nodes. The nodes forming the
+// compact range for [0, size) are immutable once the tree has grown beyond
+// that size, so reading them from a newer snapshot yields the same root as the
+// historical version of the tree.
+func rootHashAtSize(ctx context.Context, nr nodeReader, hasher merkle.LogHasher, size uint64) ([]byte, error) {
+	if size == 0 {
+		return hasher.EmptyRoot(), nil
+	}
+
+	ids := compact.RangeNodes(0, size, nil)
+	nodes, err := fetchNodes(ctx, nr, ids)
+	if err != nil {
+		return nil, err
+	}
+	hashes := make([][]byte, len(nodes))
+	for i, node := range nodes {
+		hashes[i] = node.Hash
+	}
+
+	r, err := (&compact.RangeFactory{Hash: hasher.HashChildren}).NewRange(0, size, hashes)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetRootHash(nil)
 }

@@ -274,6 +274,10 @@ func (s *preorderedLogSequencingTask) update(ctx context.Context, leaves []*tril
 // IntegrateBatch wraps up all the operations needed to take a batch of queued
 // or sequenced leaves and integrate them into the tree.
 func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWindow, maxRootDurationInterval time.Duration, ts clock.TimeSource, ls storage.LogStorage, qm quota.Manager) (int, error) {
+	// IntegrateBatch can be used directly by callers that do not construct an
+	// OperationManager, so make sure the package metrics are initialized.
+	InitMetrics(nil)
+
 	start := ts.Now()
 	label := strconv.FormatInt(tree.TreeId, 10)
 

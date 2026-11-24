@@ -210,6 +210,12 @@ func (t *TrillianLogRPCServer) GetInclusionProof(ctx context.Context, req *trill
 	}
 	t.recordIndexPercent(req.LeafIndex, root.TreeSize)
 
+	slr, err = t.signedLogRootForTreeSize(ctx, tx, hasher, &root, slr, uint64(req.TreeSize))
+	if err != nil {
+		return nil, err
+	}
+	r.SignedLogRoot = slr
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -272,6 +278,13 @@ func (t *TrillianLogRPCServer) GetInclusionProofByHash(ctx context.Context, req 
 		t.recordIndexPercent(leaf.LeafIndex, root.TreeSize)
 	}
 
+	if len(proofs) > 0 {
+		slr, err = t.signedLogRootForTreeSize(ctx, tx, hasher, &root, slr, uint64(req.TreeSize))
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -325,6 +338,14 @@ func (t *TrillianLogRPCServer) GetConsistencyProof(ctx context.Context, req *tri
 	proof, err := tryGetConsistencyProof(ctx, uint64(req.FirstTreeSize), uint64(req.SecondTreeSize), tx, hasher)
 	if err != nil {
 		return nil, err
+	}
+
+	if req.FirstTreeSize != req.SecondTreeSize {
+		slr, err = t.signedLogRootForTreeSize(ctx, tx, hasher, &root, slr, uint64(req.SecondTreeSize))
+		if err != nil {
+			return nil, err
+		}
+		r.SignedLogRoot = slr
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -508,6 +529,12 @@ func (t *TrillianLogRPCServer) GetEntryAndProof(ctx context.Context, req *trilli
 		// Work is complete, we have everything we need for the response
 		r.Proof = proof
 		r.Leaf = leaves[0]
+
+		slr, err = t.signedLogRootForTreeSize(ctx, tx, hasher, &root, slr, uint64(req.TreeSize))
+		if err != nil {
+			return nil, err
+		}
+		r.SignedLogRoot = slr
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -541,6 +568,33 @@ func getInclusionProofForLeafIndex(ctx context.Context, tx storage.ReadOnlyLogTr
 		return nil, err
 	}
 	return fetchNodesAndBuildProof(ctx, tx, hasher.HashChildren, leafIndex, nodes)
+}
+
+// signedLogRootForTreeSize returns a SignedLogRoot that identifies the tree at
+// the requested size. If the requested size is the latest published tree size,
+// the latest root is returned unchanged. Otherwise, the root hash is rebuilt
+// from the immutable nodes covered by the requested size in the same snapshot
+// that served the proof, and the returned root is stamped with the requested
+// tree size. This keeps the proof, its tree size, and the returned tree head
+// from the same version of the log.
+func (t *TrillianLogRPCServer) signedLogRootForTreeSize(ctx context.Context, tx storage.ReadOnlyLogTreeTX, hasher merkle.LogHasher, latest *types.LogRootV1, latestSLR *trillian.SignedLogRoot, size uint64) (*trillian.SignedLogRoot, error) {
+	if size == latest.TreeSize {
+		return latestSLR, nil
+	}
+
+	rootHash, err := rootHashAtSize(ctx, tx, hasher, size)
+	if err != nil {
+		return nil, err
+	}
+
+	logRoot := *latest
+	logRoot.TreeSize = size
+	logRoot.RootHash = rootHash
+	logRootBytes, err := logRoot.MarshalBinary()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not marshal log root for tree size %d: %v", size, err)
+	}
+	return &trillian.SignedLogRoot{LogRoot: logRootBytes}, nil
 }
 
 func (t *TrillianLogRPCServer) getTreeAndHasher(ctx context.Context, treeID int64, opts trees.GetOpts) (*trillian.Tree, merkle.LogHasher, error) {
