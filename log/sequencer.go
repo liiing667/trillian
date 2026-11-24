@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -274,16 +275,33 @@ func (s *preorderedLogSequencingTask) update(ctx context.Context, leaves []*tril
 // IntegrateBatch wraps up all the operations needed to take a batch of queued
 // or sequenced leaves and integrate them into the tree.
 func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWindow, maxRootDurationInterval time.Duration, ts clock.TimeSource, ls storage.LogStorage, qm quota.Manager) (int, error) {
+	// IntegrateBatch is also used directly by embedders and tests that do not
+	// come through SequencerManager. Make sure the metrics are usable even in
+	// that case; if the manager initialized them first this is a no-op.
+	InitMetrics(nil)
+
 	start := ts.Now()
 	label := strconv.FormatInt(tree.TreeId, 10)
 
-	numLeaves := 0
-	var newLogRoot *types.LogRootV1
-	var newSLR *trillian.SignedLogRoot
+	// The storage layer is allowed to retry the transaction function. Keep all
+	// state for a single attempt inside the closure, and only copy the result
+	// out once the attempt has successfully reached the end of the function.
+	// This prevents a failed attempt from publishing a different batch, tree
+	// size, node set, or signed root than the one that eventually commits.
+	var committedNumLeaves int
+	var committedLogRoot *types.LogRootV1
+	var committedSLR *trillian.SignedLogRoot
+	// Best-effort evidence about the last attempt, used only to describe a
+	// failure returned by the transaction wrapper (for example a failed
+	// commit) after the closure has returned successfully.
+	var lastCandidateSize uint64
+	var rootStaged bool
 	err := ls.ReadWriteTransaction(ctx, tree, func(ctx context.Context, tx storage.LogTreeTX) error {
 		stageStart := ts.Now()
 		defer seqBatches.Inc(label)
 		defer func() { seqLatency.Observe(clock.SecondsSince(ts, start), label) }()
+		lastCandidateSize = 0
+		rootStaged = false
 
 		// Get the latest known root from storage
 		sth, err := tx.LatestSignedLogRoot(ctx)
@@ -297,6 +315,7 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 		if err := currentRoot.UnmarshalBinary(sth.LogRoot); err != nil {
 			return fmt.Errorf("%v: Sequencer failed to unmarshal latest root: %v", tree.TreeId, err)
 		}
+		lastCandidateSize = currentRoot.TreeSize
 		seqGetRootLatency.Observe(clock.SecondsSince(ts, stageStart), label)
 		seqTreeSize.Set(float64(currentRoot.TreeSize), label)
 
@@ -304,6 +323,17 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 			klog.Warningf("%v: Fresh log - no previous TreeHeads exist.", tree.TreeId)
 			return storage.ErrTreeNeedsInit
 		}
+
+		// Validate the latest root *before* accepting any leaves from the
+		// queue. A corrupted or otherwise inconsistent root must not consume
+		// work that a later attempt would then have to recover.
+		stageStart = ts.Now()
+		cr, err := initCompactRangeFromStorage(ctx, &currentRoot, tx)
+		if err != nil {
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=init-tree size=%d: %v", label, currentRoot.TreeSize, err)
+		}
+		seqInitTreeLatency.Observe(clock.SecondsSince(ts, stageStart), label)
+		stageStart = ts.Now()
 
 		taskData := &sequencingTaskData{
 			label:      label,
@@ -323,9 +353,9 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 
 		sequencedLeaves, err := st.fetch(ctx, limit, start.Add(-guardWindow))
 		if err != nil {
-			return fmt.Errorf("%v: Sequencer failed to load sequenced batch: %v", tree.TreeId, err)
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=dequeue size=%d: %v", label, currentRoot.TreeSize, err)
 		}
-		numLeaves = len(sequencedLeaves)
+		numLeaves := len(sequencedLeaves)
 
 		// We need to create a signed root if entries were added or the latest root
 		// is too old.
@@ -340,28 +370,21 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 			klog.Infof("%v: Force new root generation as %v since last root", tree.TreeId, interval)
 		}
 
-		stageStart = ts.Now()
-		cr, err := initCompactRangeFromStorage(ctx, &currentRoot, tx)
-		if err != nil {
-			return fmt.Errorf("%v: compact range init failed: %v", tree.TreeId, err)
-		}
-		seqInitTreeLatency.Observe(clock.SecondsSince(ts, stageStart), label)
-		stageStart = ts.Now()
-
 		// We've done all the reads, can now do the updates in the same
 		// transaction. Collate node updates.
 		if err := prepareLeaves(sequencedLeaves, cr.End(), label, ts); err != nil {
-			return err
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=prepare-leaves size=%d: %v", label, cr.End(), err)
 		}
 		nodeMap, newRoot, err := updateCompactRange(cr, sequencedLeaves, label)
 		if err != nil {
-			return err
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=update-tree size=%d: %v", label, cr.End(), err)
 		}
+		lastCandidateSize = cr.End()
 		seqWriteTreeLatency.Observe(clock.SecondsSince(ts, stageStart), label)
 
 		// Store the sequenced batch.
 		if err := st.update(ctx, sequencedLeaves); err != nil {
-			return err
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=update-leaves size=%d: %v", label, cr.End(), err)
 		}
 		stageStart = ts.Now()
 
@@ -373,7 +396,7 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 		// Now insert or update the nodes affected by the above, at the new tree
 		// version.
 		if err := tx.SetMerkleNodes(ctx, targetNodes); err != nil {
-			return fmt.Errorf("%v: Sequencer failed to set Merkle nodes: %v", tree.TreeId, err)
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=set-nodes size=%d: %v", label, cr.End(), err)
 		}
 		seqSetNodesLatency.Observe(clock.SecondsSince(ts, stageStart), label)
 		stageStart = ts.Now()
@@ -383,7 +406,7 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 			// Override the nil root hash returned by the compact range.
 			newRoot = rfc6962.DefaultHasher.EmptyRoot()
 		}
-		newLogRoot = &types.LogRootV1{
+		newLogRoot := &types.LogRootV1{
 			RootHash:       newRoot,
 			TimestampNanos: uint64(ts.Now().UnixNano()),
 			TreeSize:       cr.End(),
@@ -393,33 +416,46 @@ func IntegrateBatch(ctx context.Context, tree *trillian.Tree, limit int, guardWi
 			time.Millisecond), label)
 
 		if newLogRoot.TimestampNanos <= currentRoot.TimestampNanos {
-			return fmt.Errorf("%v: refusing to sign root with timestamp earlier than previous root (%d <= %d)", tree.TreeId, newLogRoot.TimestampNanos, currentRoot.TimestampNanos)
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=store-root size=%d: %v: refusing to sign root with timestamp earlier than previous root (%d <= %d)", label, newLogRoot.TreeSize, tree.TreeId, newLogRoot.TimestampNanos, currentRoot.TimestampNanos)
 		}
 
 		logRoot, err := newLogRoot.MarshalBinary()
 		if err != nil {
-			return fmt.Errorf("%v: signer failed to marshal root: %v", tree.TreeId, err)
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=marshal-root size=%d: %v", label, newLogRoot.TreeSize, err)
 		}
 		newSLR := &trillian.SignedLogRoot{LogRoot: logRoot}
 
 		if err := tx.StoreSignedLogRoot(ctx, newSLR); err != nil {
-			return fmt.Errorf("%v: failed to write updated tree root: %v", tree.TreeId, err)
+			return fmt.Errorf("sequencer rollback/evidence: tree=%s stage=store-root size=%d: %v", label, newLogRoot.TreeSize, err)
 		}
+		rootStaged = true
 		seqStoreRootLatency.Observe(clock.SecondsSince(ts, stageStart), label)
+
+		// This attempt has produced a complete, internally consistent
+		// generation. Publish it to the caller only if the transaction commits.
+		committedNumLeaves = numLeaves
+		committedLogRoot = newLogRoot
+		committedSLR = newSLR
 		return nil
 	})
 	if err != nil {
+		// The closure returned successfully and staged a complete candidate,
+		// but the transaction wrapper failed to commit it. Add the same
+		// evidence that write-stage failures carry.
+		if rootStaged && !strings.HasPrefix(err.Error(), "sequencer rollback/evidence:") {
+			return 0, fmt.Errorf("sequencer rollback/evidence: tree=%s stage=store-root size=%d: %v", label, lastCandidateSize, err)
+		}
 		return 0, err
 	}
 
 	// Let quota.Manager know about newly-sequenced entries.
-	replenishQuota(ctx, numLeaves, tree.TreeId, qm)
+	replenishQuota(ctx, committedNumLeaves, tree.TreeId, qm)
 
-	seqCounter.Add(float64(numLeaves), label)
-	if newSLR != nil {
-		klog.Infof("%v: sequenced %v leaves, size %v", tree.TreeId, numLeaves, newLogRoot.TreeSize)
+	seqCounter.Add(float64(committedNumLeaves), label)
+	if committedSLR != nil {
+		klog.Infof("%v: sequenced %v leaves, size %v", tree.TreeId, committedNumLeaves, committedLogRoot.TreeSize)
 	}
-	return numLeaves, nil
+	return committedNumLeaves, nil
 }
 
 // replenishQuota replenishes all quotas, such as {Tree/Global, Read/Write},

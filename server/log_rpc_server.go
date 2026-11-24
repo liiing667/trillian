@@ -198,25 +198,51 @@ func (t *TrillianLogRPCServer) GetInclusionProof(ctx context.Context, req *trill
 		return nil, status.Errorf(codes.Internal, "Could not read current log root: %v", err)
 	}
 
-	r := &trillian.GetInclusionProofResponse{SignedLogRoot: slr}
-
 	if uint64(req.TreeSize) > root.TreeSize {
-		return r, nil
+		return &trillian.GetInclusionProofResponse{SignedLogRoot: slr}, nil
 	}
 
-	proof, err := getInclusionProofForLeafIndex(ctx, tx, hasher, uint64(req.TreeSize), uint64(req.LeafIndex))
+	inclProof, err := getInclusionProofForLeafIndex(ctx, tx, hasher, uint64(req.TreeSize), uint64(req.LeafIndex))
 	if err != nil {
 		return nil, err
 	}
 	t.recordIndexPercent(req.LeafIndex, root.TreeSize)
 
+	// A proof for a historical tree size must be returned together with the
+	// root that the proof actually represents, not with the latest signed root.
+	// Otherwise clients cannot tell which tree generation the proof belongs to.
+	respRoot := slr
+	if uint64(req.TreeSize) < root.TreeSize {
+		leaves, err := tx.GetLeavesByRange(ctx, req.LeafIndex, 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(leaves) != 1 || leaves[0].LeafIndex != req.LeafIndex {
+			return nil, status.Errorf(codes.NotFound, "leaf %d not found at tree size %d", req.LeafIndex, req.TreeSize)
+		}
+		rootHash, err := proof.RootFromInclusionProof(hasher, uint64(req.LeafIndex), uint64(req.TreeSize), leaves[0].MerkleLeafHash, inclProof.Hashes)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to compute root for tree size %d: %v", req.TreeSize, err)
+		}
+		logRoot, err := (&types.LogRootV1{
+			RootHash:       rootHash,
+			TimestampNanos: root.TimestampNanos,
+			TreeSize:       uint64(req.TreeSize),
+		}).MarshalBinary()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to marshal root for tree size %d: %v", req.TreeSize, err)
+		}
+		respRoot = &trillian.SignedLogRoot{LogRoot: logRoot}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
-	r.Proof = proof
-
-	return r, nil
+	return &trillian.GetInclusionProofResponse{
+		SignedLogRoot: respRoot,
+		Proof:         inclProof,
+	}, nil
 }
 
 // GetInclusionProofByHash obtains proofs of inclusion by leaf hash. Because some logs can

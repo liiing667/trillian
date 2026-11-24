@@ -138,16 +138,54 @@ func (m *TreeStorage) beginTreeTX(ctx context.Context, treeID int64, hashSizeByt
 		tree.Lock()
 		unlock = tree.Unlock
 	}
+	store := tree.store.Clone()
+
+	// btree.Clone copies item pointers, so mutable values (the queue and the
+	// hash-to-sequence index) would otherwise still be shared with the
+	// committed tree. Give each transaction private copies so that a rolled
+	// back transaction cannot consume queued leaves or publish sequence
+	// mappings from a generation that never committed.
+	copyMutableValues(store, treeID)
+
 	return treeTX{
 		ts:            m,
-		tx:            tree.store.Clone(),
+		tx:            store,
 		tree:          tree,
 		treeID:        treeID,
 		hashSizeBytes: hashSizeBytes,
 		subtreeCache:  cache,
 		writeRevision: -1,
+		readonly:      readonly,
 		unlock:        unlock,
 	}, nil
+}
+
+// copyMutableValues replaces the mutable values stored in the cloned B-tree
+// with transaction-private copies. Immutable entries (signed roots, revisions,
+// and subtree protos, which are cloned on read) can continue to be shared.
+func copyMutableValues(store *btree.BTree, treeID int64) {
+	if item := store.Get(unseqKey(treeID)); item != nil {
+		if kvItem, ok := item.(*kv); ok {
+			if queue, ok := kvItem.v.(*list.List); ok {
+				queueCopy := list.New()
+				for e := queue.Front(); e != nil; e = e.Next() {
+					queueCopy.PushBack(e.Value)
+				}
+				store.ReplaceOrInsert(&kv{k: kvItem.k, v: queueCopy})
+			}
+		}
+	}
+	if item := store.Get(hashToSeqKey(treeID)); item != nil {
+		if kvItem, ok := item.(*kv); ok {
+			if index, ok := kvItem.v.(map[string][]int64); ok {
+				indexCopy := make(map[string][]int64, len(index))
+				for hash, seqs := range index {
+					indexCopy[hash] = append([]int64(nil), seqs...)
+				}
+				store.ReplaceOrInsert(&kv{k: kvItem.k, v: indexCopy})
+			}
+		}
+	}
 }
 
 type treeTX struct {
@@ -159,6 +197,8 @@ type treeTX struct {
 	hashSizeBytes int
 	subtreeCache  *cache.SubtreeCache
 	writeRevision int64
+	readonly      bool
+	pendingSTH    uint64
 	unlock        func()
 }
 
@@ -222,6 +262,9 @@ func (t *treeTX) SetMerkleNodes(ctx context.Context, nodes []stree.Node) error {
 func (t *treeTX) Commit(ctx context.Context) error {
 	defer t.unlock()
 
+	if t.closed {
+		return nil
+	}
 	if t.writeRevision > -1 {
 		tiles, err := t.subtreeCache.UpdatedTiles()
 		if err != nil {
@@ -234,8 +277,15 @@ func (t *treeTX) Commit(ctx context.Context) error {
 		}
 	}
 	t.closed = true
-	// update the shared view of the tree post TX:
-	t.tree.store = t.tx
+	if !t.readonly {
+		// Update the shared view of the tree only after all writes have been
+		// staged successfully. Read-only transactions must not publish
+		// anything, even though the cloned store is equivalent.
+		t.tree.store = t.tx
+		if t.pendingSTH > t.tree.currentSTH {
+			t.tree.currentSTH = t.pendingSTH
+		}
+	}
 	return nil
 }
 

@@ -347,9 +347,12 @@ func (t *logTreeTX) StoreSignedLogRoot(ctx context.Context, slr *trillian.Signed
 	k.(*kv).v = t.writeRevision
 	t.tx.ReplaceOrInsert(k)
 
-	// TODO(alcutter): this breaks the transactional model
-	if root.TimestampNanos > t.tree.currentSTH {
-		t.tree.currentSTH = root.TimestampNanos
+	// Publish the new tree head only when the transaction commits. Updating
+	// the shared marker here would let a failed or retried transaction expose
+	// a signed root (and, through it, a different tree generation) that was
+	// never committed.
+	if root.TimestampNanos > t.pendingSTH {
+		t.pendingSTH = root.TimestampNanos
 	}
 	return nil
 }

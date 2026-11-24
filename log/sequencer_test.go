@@ -321,6 +321,7 @@ func TestIntegrateBatch(t *testing.T) {
 				dequeueLimit:        1,
 				shouldCommit:        true,
 				latestSignedRoot:    testSignedRoot16,
+				merkleNodesGet:      &compactTree16,
 				dequeuedLeaves:      noLeaves,
 				skipStoreSignedRoot: true,
 			},
@@ -332,6 +333,7 @@ func TestIntegrateBatch(t *testing.T) {
 				dequeueLimit:        1,
 				shouldCommit:        true,
 				latestSignedRoot:    testSignedRoot16,
+				merkleNodesGet:      &compactTree16,
 				dequeuedLeaves:      noLeaves,
 				skipStoreSignedRoot: true,
 			},
@@ -376,6 +378,7 @@ func TestIntegrateBatch(t *testing.T) {
 				dequeueLimit:        1,
 				shouldCommit:        true,
 				latestSignedRoot:    testSignedRoot16,
+				merkleNodesGet:      &compactTree16,
 				dequeuedLeaves:      []*trillian.LogLeaf{},
 				skipStoreSignedRoot: true,
 				overrideDequeueTime: &expectedCutoffTime,
@@ -388,6 +391,7 @@ func TestIntegrateBatch(t *testing.T) {
 				logID:               154035,
 				dequeueLimit:        1,
 				latestSignedRoot:    testSignedRoot16,
+				merkleNodesGet:      &compactTree16,
 				dequeuedError:       errors.New("dequeue"),
 				skipStoreSignedRoot: true,
 			},
@@ -410,10 +414,10 @@ func TestIntegrateBatch(t *testing.T) {
 			params: testParameters{
 				logID:               154035,
 				dequeueLimit:        1,
-				dequeuedLeaves:      []*trillian.LogLeaf{getLeaf42()},
 				latestSignedRoot:    testSignedRoot21,
 				merkleNodesGet:      &compactTree21,
 				merkleNodesGetError: errors.New("getmerklenodes"),
+				skipDequeue:         true,
 				skipStoreSignedRoot: true,
 			},
 			errStr: "getmerklenodes",
@@ -664,9 +668,7 @@ func TestIntegrateBatch_PutTokens(t *testing.T) {
 			logTX := storage.NewMockLogTreeTX(ctrl)
 			logTX.EXPECT().DequeueLeaves(any, any, any).Return(test.leaves, nil)
 			logTX.EXPECT().LatestSignedLogRoot(any).Return(testSignedRoot16, nil)
-			if len(test.leaves) != 0 {
-				logTX.EXPECT().GetMerkleNodes(any, any).Return(compactTree16, nil)
-			}
+			logTX.EXPECT().GetMerkleNodes(any, any).Return(compactTree16, nil)
 			logTX.EXPECT().UpdateSequencedLeaves(any, any).AnyTimes().Return(nil)
 			logTX.EXPECT().SetMerkleNodes(any, any).AnyTimes().Return(nil)
 			logTX.EXPECT().StoreSignedLogRoot(any, any).AnyTimes().Return(nil)
