@@ -26,6 +26,8 @@ import (
 	"github.com/google/trillian/storage/cache"
 	"github.com/google/trillian/storage/storagepb"
 	stree "github.com/google/trillian/storage/tree"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
@@ -123,11 +125,18 @@ func newTree(t *trillian.Tree) *tree {
 	k.(*kv).v = make(map[string][]int64)
 	ret.store.ReplaceOrInsert(k)
 
+	k = identityHashKey(t.TreeId)
+	k.(*kv).v = make(map[string]int64)
+	ret.store.ReplaceOrInsert(k)
+
 	return ret
 }
 
 func (m *TreeStorage) beginTreeTX(ctx context.Context, treeID int64, hashSizeBytes int, cache *cache.SubtreeCache, readonly bool) (treeTX, error) {
 	tree := m.getTree(treeID)
+	if tree == nil {
+		return treeTX{}, status.Errorf(codes.NotFound, "tree %v not found", treeID)
+	}
 	// Lock the tree for the duration of the TX.
 	// It will be unlocked by a call to Commit or Close.
 	var unlock func()
