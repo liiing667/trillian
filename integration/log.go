@@ -17,6 +17,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -28,18 +29,22 @@ import (
 	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
 	inmemory "github.com/transparency-dev/merkle/testonly"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 )
 
 // TestParameters bundles up all the settings for a test run
 type TestParameters struct {
-	TreeID              int64
-	CheckLogEmpty       bool
-	QueueLeaves         bool
-	AwaitSequencing     bool
-	StartLeaf           int64
-	LeafCount           int64
-	UniqueLeaves        int64
+	TreeID          int64
+	CheckLogEmpty   bool
+	QueueLeaves     bool
+	AwaitSequencing bool
+	StartLeaf       int64
+	LeafCount       int64
+	UniqueLeaves    int64
+	// UniqueIdentities assigns a distinct LeafIdentityHash to every generated
+	// leaf, even when several leaves share the same LeafValue.
+	UniqueIdentities    bool
 	QueueBatchSize      int
 	SequencerBatchSize  int
 	ReadBatchSize       int64
@@ -216,7 +221,13 @@ func genEntries(params TestParameters) []*trillian.LogLeaf {
 
 	leaves := make([]*trillian.LogLeaf, 0, params.LeafCount)
 	for l := int64(0); l < params.LeafCount; l++ {
-		leaves = append(leaves, uniqueLeaves[int64(perm[l])%params.UniqueLeaves])
+		leaf := uniqueLeaves[int64(perm[l])%params.UniqueLeaves]
+		if params.UniqueIdentities {
+			leaf = proto.Clone(leaf).(*trillian.LogLeaf)
+			identity := sha256.Sum256([]byte(fmt.Sprintf("%sIdentity %d", params.CustomLeafPrefix, params.StartLeaf+l)))
+			leaf.LeafIdentityHash = identity[:]
+		}
+		leaves = append(leaves, leaf)
 	}
 	return leaves
 }

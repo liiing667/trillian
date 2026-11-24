@@ -147,6 +147,7 @@ func TestInProcessLogIntegrationDuplicateLeaves(t *testing.T) {
 
 	params := DefaultTestParameters(tree.TreeId)
 	params.UniqueLeaves = 10
+	params.UniqueIdentities = true
 	if err := RunLogIntegration(env.Log, params); err != nil {
 		t.Fatalf("Test failed: %v", err)
 	}

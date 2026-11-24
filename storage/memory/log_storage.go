@@ -33,6 +33,8 @@ import (
 	"github.com/transparency-dev/merkle/rfc6962"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
 )
 
@@ -70,6 +72,13 @@ func seqLeafKey(treeID, seq int64) btree.Item {
 // the given hash.
 func hashToSeqKey(treeID int64) btree.Item {
 	return &kv{k: fmt.Sprintf("/%d/h2s", treeID)}
+}
+
+// leafDataKey formats a key for use in a tree's BTree store. The associated
+// Item value is the canonical LogLeaf recorded when the leaf identity was
+// first queued.
+func leafDataKey(treeID int64, identityHash []byte) btree.Item {
+	return &kv{k: fmt.Sprintf("/%d/leafdata/%x", treeID, identityHash)}
 }
 
 // sthKey formats a key for use in a tree's BTree store.
@@ -269,13 +278,31 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 		}
 	}
 	queuedCounter.Add(float64(len(leaves)), labelForTX(t))
-	// No deduping in this storage!
 	k := unseqKey(t.treeID)
 	q := t.tx.Get(k).(*kv).v.(*list.List)
-	for _, l := range leaves {
-		q.PushBack(l)
+	existing := make([]*trillian.LogLeaf, len(leaves))
+	for i, l := range leaves {
+		l.QueueTimestamp = timestamppb.New(queueTimestamp)
+
+		// Leaf identity is the deduplication key. Different identities with
+		// identical leaf values are independent entries, so the value/hash
+		// fields are deliberately not part of this key.
+		lk := leafDataKey(t.treeID, l.LeafIdentityHash)
+		if e := t.tx.Get(lk); e != nil {
+			// Return the original leaf data as evidence of the duplicate.
+			existing[i] = e.(*kv).v.(*trillian.LogLeaf)
+			continue
+		}
+
+		// Keep the canonical leaf data separately from the queue entry so that
+		// sequencing metadata written to the queued copy cannot mutate the
+		// duplicate lookup evidence.
+		stored := proto.Clone(l).(*trillian.LogLeaf)
+		lk.(*kv).v = stored
+		t.tx.ReplaceOrInsert(lk)
+		q.PushBack(proto.Clone(stored).(*trillian.LogLeaf))
 	}
-	return make([]*trillian.LogLeaf, len(leaves)), nil
+	return existing, nil
 }
 
 func (t *logTreeTX) AddSequencedLeaves(ctx context.Context, leaves []*trillian.LogLeaf, timestamp time.Time) ([]*trillian.QueuedLogLeaf, error) {
@@ -355,14 +382,13 @@ func (t *logTreeTX) StoreSignedLogRoot(ctx context.Context, slr *trillian.Signed
 }
 
 func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillian.LogLeaf) error {
-	countByMerkleHash := make(map[string]int)
+	countByIdentity := make(map[string]int)
 	for _, leaf := range leaves {
 		// This should fail on insert but catch it early
 		if got, want := len(leaf.LeafIdentityHash), t.hashSizeBytes; got != want {
 			return fmt.Errorf("sequenced leaf has incorrect hash size: got %v, want %v", got, want)
 		}
-		mh := string(leaf.MerkleLeafHash)
-		countByMerkleHash[mh]++
+		countByIdentity[string(leaf.LeafIdentityHash)]++
 		// insert sequenced leaf:
 		k := seqLeafKey(t.treeID, leaf.LeafIndex)
 		k.(*kv).v = leaf
@@ -376,14 +402,13 @@ func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillia
 
 	q := t.tx.Get(unseqKey(t.treeID)).(*kv).v.(*list.List)
 	toRemove := make([]*list.Element, 0, q.Len())
-	for e := q.Front(); e != nil && len(countByMerkleHash) > 0; e = e.Next() {
-		h := e.Value.(*trillian.LogLeaf).MerkleLeafHash
-		mh := string(h)
-		if countByMerkleHash[mh] > 0 {
-			countByMerkleHash[mh]--
+	for e := q.Front(); e != nil && len(countByIdentity) > 0; e = e.Next() {
+		identity := string(e.Value.(*trillian.LogLeaf).LeafIdentityHash)
+		if countByIdentity[identity] > 0 {
+			countByIdentity[identity]--
 			toRemove = append(toRemove, e)
-			if countByMerkleHash[mh] == 0 {
-				delete(countByMerkleHash, mh)
+			if countByIdentity[identity] == 0 {
+				delete(countByIdentity, identity)
 			}
 		}
 	}
@@ -391,8 +416,8 @@ func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillia
 		q.Remove(e)
 	}
 
-	if unknown := len(countByMerkleHash); unknown != 0 {
-		return fmt.Errorf("attempted to update %d unknown leaves: %x", unknown, countByMerkleHash)
+	if unknown := len(countByIdentity); unknown != 0 {
+		return fmt.Errorf("attempted to update %d unknown leaves: %x", unknown, countByIdentity)
 	}
 
 	return nil
