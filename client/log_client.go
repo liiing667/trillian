@@ -16,7 +16,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -133,6 +132,9 @@ func (c *LogClient) WaitForRootUpdate(ctx context.Context) (*types.LogRootV1, er
 // getAndVerifyLatestRoot fetches and verifies the latest root against a trusted root, seen in the past.
 // Pass nil for trusted if this is the first time querying this log.
 func (c *LogClient) getAndVerifyLatestRoot(ctx context.Context, trusted *types.LogRootV1) (*types.LogRootV1, error) {
+	if trusted == nil {
+		trusted = &types.LogRootV1{}
+	}
 	resp, err := c.client.GetLatestSignedLogRoot(ctx,
 		&trillian.GetLatestSignedLogRootRequest{
 			LogId:         c.LogID,
@@ -141,34 +143,18 @@ func (c *LogClient) getAndVerifyLatestRoot(ctx context.Context, trusted *types.L
 	if err != nil {
 		return nil, err
 	}
+	if resp.GetSignedLogRoot() == nil {
+		return nil, fmt.Errorf("GetLatestSignedLogRoot() returned no signed root")
+	}
 
-	// TODO(gbelvin): Turn on root verification.
-	/*
-		logRoot, err := c.VerifyRoot(&types.LogRootV1{}, resp.GetSignedLogRoot(), nil)
-		if err != nil {
-			return nil, err
-		}
-	*/
-	// TODO(gbelvin): Remove this hack when all implementations store digital signatures.
-	var logRoot types.LogRootV1
-	if err := logRoot.UnmarshalBinary(resp.GetSignedLogRoot().LogRoot); err != nil {
+	// Verify every root transition, including transitions to or from an empty
+	// tree. Skipping verification for an empty candidate lets a malformed root
+	// become the saved generation, which would later anchor inclusion proofs.
+	verified, err := c.VerifyRoot(trusted, resp.GetSignedLogRoot(), resp.GetProof().GetHashes())
+	if err != nil {
 		return nil, err
 	}
-
-	if trusted.TreeSize > 0 &&
-		logRoot.TreeSize == trusted.TreeSize &&
-		bytes.Equal(logRoot.RootHash, trusted.RootHash) {
-		// Tree has not been updated.
-		return &logRoot, nil
-	}
-
-	// Verify root update if the tree / the latest signed log root isn't empty.
-	if logRoot.TreeSize > 0 {
-		if _, err := c.VerifyRoot(trusted, resp.GetSignedLogRoot(), resp.GetProof().GetHashes()); err != nil {
-			return nil, err
-		}
-	}
-	return &logRoot, nil
+	return verified, nil
 }
 
 // GetRoot returns a copy of the latest trusted root.

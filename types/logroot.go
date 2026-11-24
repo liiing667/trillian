@@ -88,6 +88,9 @@ func (l *LogRootV1) UnmarshalBinary(logRootBytes []byte) error {
 	if _, err := tls.Unmarshal(logRootBytes, &logRoot); err != nil {
 		return err
 	}
+	if logRoot.V1 == nil {
+		return fmt.Errorf("invalid LogRoot: missing v1 root")
+	}
 
 	*l = *logRoot.V1
 	return nil
