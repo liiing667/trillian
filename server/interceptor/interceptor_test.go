@@ -182,6 +182,111 @@ func TestTrillianInterceptor_TreeInterception(t *testing.T) {
 	}
 }
 
+// TestTrillianInterceptor_ContextTreeConsistency checks that the interceptor keeps the
+// requested tree identity consistent with any tree already present in the request
+// context: requests are authorized against the tree read from storage, and a context
+// carrying a different (or stale) tree identity causes the request to be rejected
+// rather than letting downstream consumers act on the wrong tree.
+func TestTrillianInterceptor_ContextTreeConsistency(t *testing.T) {
+	logTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	logTree.TreeId = 10
+
+	otherLogTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	otherLogTree.TreeId = 11
+
+	deletedTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	deletedTree.TreeId = 12
+	deletedTree.Deleted = true
+	deletedTree.DeleteTime = timestamppb.Now()
+
+	// staleTree is what a context might still carry for deletedTree: same tree ID,
+	// but captured before the tree was deleted.
+	staleTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	staleTree.TreeId = deletedTree.TreeId
+
+	tests := []struct {
+		desc     string
+		ctxTree  *trillian.Tree
+		req      interface{}
+		wantCode codes.Code
+		wantTree *trillian.Tree
+	}{
+		{
+			desc:     "noTreeInCtx",
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			wantCode: codes.OK,
+			wantTree: logTree,
+		},
+		{
+			desc:     "correctTreeInCtx",
+			ctxTree:  logTree,
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			wantCode: codes.OK,
+			wantTree: logTree,
+		},
+		{
+			desc:     "interleavedTreesCtxARequestB",
+			ctxTree:  logTree,
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: otherLogTree.TreeId},
+			wantCode: codes.Internal,
+		},
+		{
+			desc:     "interleavedTreesCtxBRequestA",
+			ctxTree:  otherLogTree,
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			wantCode: codes.Internal,
+		},
+		{
+			desc:     "staleTreeInCtxDeletedInStorage",
+			ctxTree:  staleTree,
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: deletedTree.TreeId},
+			wantCode: codes.NotFound,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			admin := storage.NewMockAdminStorage(ctrl)
+			adminTX := storage.NewMockReadOnlyAdminTX(ctrl)
+			admin.EXPECT().Snapshot(gomock.Any()).AnyTimes().Return(adminTX, nil)
+			adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(logTree, nil)
+			adminTX.EXPECT().GetTree(gomock.Any(), otherLogTree.TreeId).AnyTimes().Return(otherLogTree, nil)
+			adminTX.EXPECT().GetTree(gomock.Any(), deletedTree.TreeId).AnyTimes().Return(deletedTree, nil)
+			adminTX.EXPECT().Close().AnyTimes().Return(nil)
+			adminTX.EXPECT().Commit().AnyTimes().Return(nil)
+
+			intercept := New(admin, quota.Noop(), false /* quotaDryRun */, nil /* mf */)
+			handler := &fakeHandler{resp: "handler response"}
+
+			ctx := trees.NewContext(context.Background(), test.ctxTree)
+			_, err := intercept.UnaryInterceptor(ctx, test.req,
+				&grpc.UnaryServerInfo{FullMethod: "/trillian.TrillianLog/GetLatestSignedLogRoot"},
+				handler.run)
+			if got := status.Code(err); got != test.wantCode {
+				t.Fatalf("UnaryInterceptor() returned err = %v (code %v), want code %v", err, got, test.wantCode)
+			}
+			if test.wantCode != codes.OK {
+				if handler.called {
+					t.Error("handler called for rejected request")
+				}
+				return
+			}
+			if !handler.called {
+				t.Fatal("handler not called")
+			}
+			switch tree, ok := trees.FromContext(handler.ctx); {
+			case !ok:
+				t.Error("tree not in handler ctx")
+			case !proto.Equal(tree, test.wantTree):
+				diff := cmp.Diff(tree, test.wantTree)
+				t.Errorf("post-FromContext diff:\n%v", diff)
+			}
+		})
+	}
+}
+
 func TestTrillianInterceptor_QuotaInterception(t *testing.T) {
 	logTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
 	logTree.TreeId = 10

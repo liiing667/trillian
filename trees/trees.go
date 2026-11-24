@@ -160,3 +160,38 @@ func GetTree(ctx context.Context, s storage.AdminStorage, treeID int64, opts Get
 
 	return tree, nil
 }
+
+// GetTreeFromStorage returns the specified tree, always read from storage.
+// The tree will be validated according to GetOpts before returned. Tree state is also considered
+// (for example, deleted tree will return NotFound errors).
+//
+// Unlike GetTree, a tree already present in ctx is never returned in place of the stored one.
+// Instead, the freshly read tree is checked for consistency with the identity already established
+// in ctx: if ctx already carries a tree, it must be the same tree (i.e., have the same tree ID)
+// as the requested one, otherwise an error is returned. This ensures that the tree ID, tree type
+// and deletion status used to authorize a request cannot diverge from the tree identity that
+// downstream consumers of ctx (e.g. handlers committing leaves or serving proofs) will see.
+func GetTreeFromStorage(ctx context.Context, s storage.AdminStorage, treeID int64, opts GetOpts) (*trillian.Tree, error) {
+	tree, err := storage.GetTree(ctx, s, treeID)
+	if err != nil {
+		return nil, err
+	}
+	if tree.TreeId != treeID {
+		// The tree came back from the DB with the wrong ID.
+		return nil, status.Errorf(codes.Internal, "got tree %v, want %v", tree.TreeId, treeID)
+	}
+	if ctxTree, ok := FromContext(ctx); ok && ctxTree.TreeId != treeID {
+		// No operations should span multiple trees. If a tree is already in the context
+		// it had better be the one that we want.
+		return nil, status.Errorf(codes.Internal, "got tree %v in context, want %v", ctxTree.TreeId, treeID)
+	}
+
+	if err := validate(opts, tree); err != nil {
+		return nil, err
+	}
+	if tree.Deleted {
+		return nil, status.Errorf(codes.NotFound, "tree %v not found", tree.TreeId)
+	}
+
+	return tree, nil
+}

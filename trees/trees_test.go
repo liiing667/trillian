@@ -271,3 +271,144 @@ func TestGetTree(t *testing.T) {
 		}
 	}
 }
+
+func TestGetTreeFromStorage(t *testing.T) {
+	logTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	logTree.TreeId = 1
+
+	otherLogTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	otherLogTree.TreeId = 2
+
+	frozenTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenTree.TreeId = 3
+	frozenTree.TreeState = trillian.TreeState_FROZEN
+
+	softDeletedTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	softDeletedTree.TreeId = 4
+	softDeletedTree.Deleted = true
+	softDeletedTree.DeleteTime = timestamppb.Now()
+
+	// staleActiveTree is what a context might still carry for softDeletedTree:
+	// same tree ID, but captured before the tree was deleted.
+	staleActiveTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	staleActiveTree.TreeId = softDeletedTree.TreeId
+
+	// staleActiveFrozenTree is what a context might still carry for frozenTree:
+	// same tree ID, but captured before the tree was frozen.
+	staleActiveFrozenTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	staleActiveFrozenTree.TreeId = frozenTree.TreeId
+
+	tests := []struct {
+		desc                 string
+		treeID               int64
+		opts                 GetOpts
+		ctxTree, storageTree *trillian.Tree
+		wantTree             *trillian.Tree
+		wantErr              bool
+		code                 codes.Code
+	}{
+		{
+			desc:        "noTreeInCtx",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			storageTree: logTree,
+			wantTree:    logTree,
+		},
+		{
+			desc:        "correctTreeInCtx",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			ctxTree:     logTree,
+			storageTree: logTree,
+			wantTree:    logTree,
+		},
+		{
+			desc:        "wrongTreeInCtx",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			ctxTree:     otherLogTree,
+			storageTree: logTree,
+			wantErr:     true,
+			code:        codes.Internal,
+		},
+		{
+			desc:        "wrongTreeInCtxReversed",
+			treeID:      otherLogTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			ctxTree:     logTree,
+			storageTree: otherLogTree,
+			wantErr:     true,
+			code:        codes.Internal,
+		},
+		{
+			// The context holds a stale, pre-deletion copy of the tree; the
+			// stored (deleted) state must win.
+			desc:        "staleTreeInCtxDeletedInStorage",
+			treeID:      softDeletedTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			ctxTree:     staleActiveTree,
+			storageTree: softDeletedTree,
+			wantErr:     true,
+			code:        codes.NotFound,
+		},
+		{
+			// The context holds a stale, active copy of a tree that has since
+			// been frozen; the stored (frozen) state must win.
+			desc:        "staleTreeInCtxFrozenInStorage",
+			treeID:      frozenTree.TreeId,
+			opts:        NewGetOpts(QueueLog, trillian.TreeType_LOG),
+			ctxTree:     staleActiveFrozenTree,
+			storageTree: frozenTree,
+			wantErr:     true,
+			code:        codes.PermissionDenied,
+		},
+		{
+			desc:        "wrongType",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_PREORDERED_LOG),
+			storageTree: logTree,
+			wantErr:     true,
+			code:        codes.InvalidArgument,
+		},
+		{
+			desc:        "deleted",
+			treeID:      softDeletedTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			storageTree: softDeletedTree,
+			wantErr:     true,
+			code:        codes.NotFound,
+		},
+	}
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			ctx := NewContext(context.Background(), test.ctxTree)
+
+			admin := storage.NewMockAdminStorage(ctrl)
+			tx := storage.NewMockReadOnlyAdminTX(ctrl)
+			// Storage is always read, even if the context already carries a tree.
+			admin.EXPECT().Snapshot(gomock.Any()).MaxTimes(1).Return(tx, nil)
+			tx.EXPECT().GetTree(gomock.Any(), test.treeID).MaxTimes(1).Return(test.storageTree, nil)
+			tx.EXPECT().Close().MaxTimes(1).Return(nil)
+			tx.EXPECT().Commit().MaxTimes(1).Return(nil)
+
+			tree, err := GetTreeFromStorage(ctx, admin, test.treeID, test.opts)
+			if hasErr := err != nil; hasErr != test.wantErr {
+				t.Fatalf("GetTreeFromStorage() = (_, %q), wantErr = %v", err, test.wantErr)
+			} else if hasErr {
+				if status.Code(err) != test.code {
+					t.Errorf("GetTreeFromStorage() = (_, %q), got ErrorCode: %v, want: %v", err, status.Code(err), test.code)
+				}
+				return
+			}
+
+			if !proto.Equal(tree, test.wantTree) {
+				diff := cmp.Diff(tree, test.wantTree)
+				t.Errorf("post-GetTreeFromStorage diff:\n%v", diff)
+			}
+		})
+	}
+}

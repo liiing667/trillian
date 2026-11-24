@@ -167,7 +167,12 @@ func (tp *trillianProcessor) Before(ctx context.Context, req interface{}, method
 	// TODO(codingllama): Add auth interception
 
 	if info.getTree {
-		tree, err := trees.GetTree(
+		// Read the tree from storage rather than trusting a tree that may already be in
+		// the context, so that the tree ID, tree type and deletion status used to
+		// authorize this request are consistent with the tree identity installed in the
+		// context for downstream consumers. If the context already carries a different
+		// tree the request is rejected instead of silently mixing identities.
+		tree, err := trees.GetTreeFromStorage(
 			ctx, tp.parent.admin, info.treeID, trees.NewGetOpts(trees.Admin, info.treeTypes...))
 		if err != nil {
 			incRequestDeniedCounter(badTreeReason, info.treeID, info.quotaUsers)
